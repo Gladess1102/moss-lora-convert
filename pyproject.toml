@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moss-lora-convert"
+version = "0.1.0"
+description = "MOSS-Image LoRA 格式互转：ComfyUI / kohya / peft <-> mflux"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+dependencies = ["safetensors>=0.4"]
+
+[project.optional-dependencies]
+mlx = ["mlx>=0.22"]
+
+[project.scripts]
+moss-lora-convert = "mosslora.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["mosslora*"]

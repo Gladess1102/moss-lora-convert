@@ -74,7 +74,7 @@ def emit_key(style, layer, proj, kind, with_weight=True):
             return "lora_unet_layers_%d_proj_%s.alpha" % (layer, proj)
         if style == "peft":
             return "transformer.layers.%d.proj.%s.alpha" % (layer, proj)
-        return "diffusion_model.layers.%d.proj.%s.alpha" % (layer, MFLUX_PROJ[proj])
+        return "diffusion_model.layers.%d.proj.%s.alpha" % (layer, MFLUX_PROJ.get(proj, proj))
     if style == "kohya":
         k = "lora_down" if kind == "down" else "lora_up"
         return "lora_unet_layers_%d_proj_%s.%s%s" % (layer, proj, k, suffix)
@@ -83,4 +83,4 @@ def emit_key(style, layer, proj, kind, with_weight=True):
         return "transformer.layers.%d.proj.%s.%s%s" % (layer, proj, k, suffix)
     # mflux
     k = "lora_down" if kind == "down" else "lora_up"
-    return "diffusion_model.layers.%d.proj.%s.%s%s" % (layer, MFLUX_PROJ[proj], k, suffix)
+    return "diffusion_model.layers.%d.proj.%s.%s%s" % (layer, MFLUX_PROJ.get(proj, proj), k, suffix)

@@ -3,7 +3,8 @@
   moss-lora-convert in.safetensors --to mflux
   moss-lora-convert in.safetensors --to comfyui -o out.safetensors
   moss-lora-convert in.safetensors --inspect
-  moss-lora-convert --self-test
+
+退出码：0 正常；1 有键无法识别（输出可能缺层）；2 参数错误。
 """
 from __future__ import annotations
 
@@ -48,7 +49,10 @@ def main(argv=None):
         return 0
 
     stats = convert(a.src, a.out, to=a.to, backend=a.backend, verbose=not a.quiet)
-    return 0 if stats["unknown_keys"] == 0 else 0
+    if stats["unknown_keys"]:
+        print("[warn] %d 个键无法识别，转换不完整（退出码 1）" % stats["unknown_keys"])
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

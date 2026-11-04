@@ -20,7 +20,7 @@ try:
 except ImportError:  # 不在 ComfyUI 里（比如单测）
     folder_paths = None
 
-from mosslora.convert import convert, get_backend
+from mosslora.convert import convert, get_backend, to_ir, normalize_ir
 from mosslora.formats import detect
 
 
@@ -107,6 +107,8 @@ class MOSSLoRAInspect:
     CATEGORY = "MOSS/LoRA"
 
     def run(self, lora_name):
+        if lora_name.startswith("<"):
+            raise RuntimeError("models/loras 里没有 LoRA 文件")
         src = lora_name
         if folder_paths:
             try:
@@ -116,7 +118,10 @@ class MOSSLoRAInspect:
         be = get_backend()
         w = be.load(src)
         info = detect(w.keys())
-        projs = sorted({k.split(".")[-3] for k in w if ".proj." in k})
+        # 投影名走 to_ir 的解析结果：kohya 是下划线键，字符串切片对它们恒为空
+        ir, _alphas, _unknown = to_ir(w, be)
+        ir, _warns, _alphas = normalize_ir(ir, be)
+        projs = sorted({k[1] for k in ir})
         lines = [
             "文件: %s" % os.path.basename(src),
             "键数: %d" % len(w),

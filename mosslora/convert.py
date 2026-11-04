@@ -3,6 +3,7 @@
 核心是"拆到最细粒度再拼回去"：
   qkv 融合的 up 张量按 3 等分拆成 q/k/v（down 复制三份）
   ffn_up_gate 融合的 up 张量按 2 等分拆成 up/gate（up 在前，与 mflux 的 mx.split(...,2) 一致）
+  ffn_gate_up / up_gate 是同一融合件的别名，按名字里的顺序切分（gate 在前就 gate 占前半段）
 反向则把 q/k/v 拼回 qkv、把 up/gate 拼回 ffn_up_gate。
 
 张量后端：优先 mlx（MOSS 生态必备，能读写 bf16），否则回退 safetensors.numpy。
@@ -132,10 +133,20 @@ def to_ir(weights, be):
     return ir, alphas, unknown
 
 
+# 融合名的切分顺序：名字里谁在前面，谁就占 up 张量的前半段
+_FFN_FUSED_ORDER = {
+    "ffn_up_gate": ("ffn_up", "ffn_gate"),   # mflux 的 mx.split(x, 2)：前 up、后 gate
+    "ffn_gate_up": ("ffn_gate", "ffn_up"),   # 名字即顺序：gate 在前
+    "up_gate": ("ffn_up", "ffn_gate"),
+}
+_FUSED_PROJS = ("qkv",) + tuple(_FFN_FUSED_ORDER)
+
+
 def normalize_ir(ir, be, log=None, alphas=None):
     """把融合布局（qkv / ffn_up_gate）拆成最细粒度。幂等。
 
     alphas 是 {(layer, proj): float}，跟 proj 一起拆（融合件的 alpha 复制给拆出来的每个 proj）。
+    拆不动的融合张量（行数不可整除 / 缺 lora_up）原样保留在 IR 里并告警，绝不丢弃。
     """
     out = OrderedDict()
     warns = []
@@ -144,49 +155,41 @@ def normalize_ir(ir, be, log=None, alphas=None):
     # 先收集每层的融合项
     fused = {}
     for (layer, proj, kind), t in ir.items():
-        if proj in ("qkv", "ffn_up_gate", "ffn_gate_up", "up_gate"):
+        if proj in _FUSED_PROJS:
             fused.setdefault((layer, proj), {})[kind] = t
         else:
             out[(layer, proj, kind)] = t
 
+    split_ok = set()        # 成功拆开的 (layer, proj)，只有这些的 alpha 需要换名
     for (layer, proj), parts in fused.items():
         up = parts.get("up")
         down = parts.get("down")
+        n = 3 if proj == "qkv" else 2
         if up is None:
-            warns.append("层 %d 的 %s 缺 lora_up，跳过" % (layer, proj))
-            continue
-        rows = be.shape(up)[0]
-        if proj == "qkv":
-            if rows % 3:
-                warns.append("层 %d 的 qkv up 行数 %d 不能被 3 整除，跳过" % (layer, rows))
-                continue
-            q, k, v = be.split(up, 3, axis=0)
-            for name, t in (("q", q), ("k", k), ("v", v)):
+            warns.append("层 %d 的 %s 缺 lora_up，原样保留融合张量（未拆分）" % (layer, proj))
+        elif be.shape(up)[0] % n:
+            warns.append("层 %d 的 %s up 行数 %d 不能被 %d 整除，原样保留融合张量（未拆分）"
+                         % (layer, proj, be.shape(up)[0], n))
+        else:
+            names = ("q", "k", "v") if proj == "qkv" else _FFN_FUSED_ORDER[proj]
+            for name, t in zip(names, be.split(up, n, axis=0)):
                 out[(layer, name, "up")] = t
                 if down is not None:
                     out[(layer, name, "down")] = down
-                if (layer, "qkv") in alphas_out:
-                    alphas_out[(layer, name)] = alphas_out[(layer, "qkv")]
-        else:  # ffn_up_gate：mflux 里 mx.split(x, 2) -> 前 up、后 gate
-            if rows % 2:
-                warns.append("层 %d 的 %s up 行数 %d 不能被 2 整除，跳过" % (layer, proj, rows))
-                continue
-            up_half, gate_half = be.split(up, 2, axis=0)
-            out[(layer, "ffn_up", "up")] = up_half
-            out[(layer, "ffn_gate", "up")] = gate_half
-            if down is not None:
-                out[(layer, "ffn_up", "down")] = down
-                out[(layer, "ffn_gate", "down")] = down
-            if (layer, proj) in alphas_out:
-                alphas_out[(layer, "ffn_up")] = alphas_out[(layer, proj)]
-                alphas_out[(layer, "ffn_gate")] = alphas_out[(layer, proj)]
+                if (layer, proj) in alphas_out:
+                    alphas_out[(layer, name)] = alphas_out[(layer, proj)]
+            split_ok.add((layer, proj))
+            continue
+        # 拆不动：融合张量原样留下（连同 alpha），绝不能静默丢弃
+        for kind, t in parts.items():
+            out[(layer, proj, kind)] = t
 
     if log:
         for w in warns:
             log(w)
-    # 融合名不再保留
+    # 拆成功的融合名不再保留 alpha；没拆成的保留（张量还在，alpha 不能丢）
     for k in list(alphas_out):
-        if k[1] in ("qkv", "ffn_up_gate", "ffn_gate_up", "up_gate"):
+        if k[1] in _FUSED_PROJS and k in split_ok:
             alphas_out.pop(k)
     return out, warns, alphas_out
 
@@ -219,13 +222,20 @@ def fuse_for_mflux(ir, be, log=None):
                 if proj not in ("ffn_up", "ffn_gate"):
                     out[(layer, proj, kind)] = t
         else:
+            # 融合不成立时绝不能套 mflux 的融合名 ffn_up_gate：半截张量会被当成完整的
+            # （(16,8) 冒充 (32,8)）；up/gate 都存在但只有一半能融合时，两个 IR 键还会
+            # 撞到同一个输出键，dict 后写覆盖前写，静默丢张量。
+            # mflux 布局没有独立的 ffn proj 名可降级，所以直接报错，由用户决定换目标格式
+            # 还是修源文件。
+            present = [p for p in ("ffn_up", "ffn_gate")
+                       if any((p, k) in d for k in ("up", "down"))]
+            if present:
+                raise ValueError(
+                    "层 %d: mflux 布局要求 ffn_up 与 ffn_gate 成对融合，但本层只有 %s；"
+                    "拒绝写出半截 ffn_up_gate。请改用 --to kohya/comfyui/peft 保留分开的 proj，"
+                    "或检查源文件" % (layer, "、".join(present)))
             for (proj, kind), t in d.items():
-                if proj in ("ffn_up", "ffn_gate"):
-                    if log:
-                        log("层 %d: 只有 %s 没有配对的一半，保留为独立 proj（mflux 可能忽略）" % (layer, proj))
-                    out[(layer, proj, kind)] = t
-                else:
-                    out[(layer, proj, kind)] = t
+                out[(layer, proj, kind)] = t
     return out
 
 
@@ -276,17 +286,19 @@ def fuse_qkv(ir, be, log=None):
     return out
 
 
-def from_ir(ir, style, be, alphas=None):
+def from_ir(ir, style, be, alphas=None, log=None):
     """IR -> 目标风格的权重 dict。
 
     style: 'mflux'（q/k/v 分开 + ffn 融合）
            'comfyui'（qkv 融合 + ffn 分开，键名走 kohya 下划线）
            'kohya' / 'peft'（全部最细粒度）
+
+    log 转给融合阶段：此前没传下去，那几条 warn 实际上从未打印过。
     """
     if style == "mflux":
-        ir = fuse_for_mflux(ir, be)
+        ir = fuse_for_mflux(ir, be, log)
     elif style == "comfyui":
-        ir = fuse_qkv(ir, be)
+        ir = fuse_qkv(ir, be, log)
         style = "kohya"
     out = OrderedDict()
     for (layer, proj, kind), t in sorted(ir.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2])):
@@ -294,7 +306,8 @@ def from_ir(ir, style, be, alphas=None):
     if alphas:
         seen = set()
         for (layer, proj), a in alphas.items():
-            if proj not in CANON_PROJ:
+            # 保留下来没拆开的融合件（如行数不可整除的 qkv）也要保住 alpha
+            if proj not in CANON_PROJ and proj not in _FUSED_PROJS:
                 continue
             k = emit_key(style, layer, proj, "alpha")
             if k in seen:      # ffn_up / ffn_gate 在 mflux 里映射到同一个 ffn_up_gate
@@ -309,15 +322,21 @@ def from_ir(ir, style, be, alphas=None):
 def convert(src, dst=None, to="mflux", backend=None, verbose=True):
     """把一个 LoRA 文件转成目标格式。返回统计 dict。"""
     be = get_backend(backend)
-    log = (lambda s: print("[warn] " + s)) if verbose else None
+    logged = []
+
+    def log(s):
+        logged.append(s)
+        if verbose:
+            print("[warn] " + s)
+
+    dst = dst or _default_dst(src, to)   # 先定路径：会覆盖源文件就立刻拒绝，别白读一遍
 
     weights = be.load(src)
     info = detect(weights.keys())
     ir, alphas, unknown = to_ir(weights, be)
-    ir, warns, alphas = normalize_ir(ir, be, log, alphas)
+    ir, _warns, alphas = normalize_ir(ir, be, log, alphas)
 
-    dst = dst or _default_dst(src, to)
-    out = from_ir(ir, to, be, alphas)
+    out = from_ir(ir, to, be, alphas, log)
     be.save(dst, out)
 
     stats = {
@@ -325,7 +344,7 @@ def convert(src, dst=None, to="mflux", backend=None, verbose=True):
         "src_format": info["style"], "target": to,
         "src_keys": len(weights), "dst_keys": len(out),
         "layers": len({k[0] for k in ir}), "projs": len({k[1] for k in ir}),
-        "unknown_keys": len(unknown), "warnings": len(warns),
+        "unknown_keys": len(unknown), "warnings": len(logged),
     }
     if verbose:
         print("源格式 %-8s (%d 键)  ->  %-8s (%d 键)  层 %d / proj %d"
@@ -342,7 +361,11 @@ def _default_dst(src, to):
     for tag in (".mflux", ".kohya", ".peft"):
         if base.endswith(tag):
             base = base[:-len(tag)]
-    return base + "." + to + ext
+    dst = base + "." + to + ext
+    if os.path.normcase(os.path.abspath(dst)) == os.path.normcase(os.path.abspath(src)):
+        raise ValueError(
+            "默认输出路径与源文件相同（%s），会原地覆盖源文件；请用 -o 指定输出路径" % src)
+    return dst
 
 
 def roundtrip_check(a, b, be=None):

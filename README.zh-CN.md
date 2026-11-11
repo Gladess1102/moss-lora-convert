@@ -5,6 +5,7 @@
 [![Backend](https://img.shields.io/badge/backend-MLX%20%7C%20numpy-lightgrey.svg)](#安装)
 
 [English](README.md) · **简体中文**
+**有问题或想提需求 → [Issues](https://github.com/Gladess1102/moss-lora-convert/issues)。** 说明 LoRA 是哪套训练器出的（kohya / ComfyUI / peft），并把命令一起贴上。
 
 **MOSS-Image LoRA 格式互转**：ComfyUI / kohya / peft ↔ mflux。
 

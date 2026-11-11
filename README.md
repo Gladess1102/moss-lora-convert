@@ -5,6 +5,7 @@
 [![Backend](https://img.shields.io/badge/backend-MLX%20%7C%20numpy-lightgrey.svg)](#installation)
 
 **English** · [简体中文](README.zh-CN.md)
+**Questions and bugs → [Issues](https://github.com/Gladess1102/moss-lora-convert/issues).** Say which trainer produced the LoRA (kohya / ComfyUI / peft) and paste the command you ran.
 
 Convert MOSS-Image LoRAs between **ComfyUI / kohya / peft** and **mflux**.
 
